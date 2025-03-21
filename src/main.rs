@@ -8,11 +8,14 @@ use russh::{
     server::{Handler, Msg, Server, Session},
 };
 use russh::{ChannelId, CryptoVec, server::*};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddr},
+};
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tracing::{error, info, instrument, trace};
@@ -96,6 +99,7 @@ enum NessChannelState {
 }
 
 struct NessChannel {
+    env: HashMap<String, String>,
     state: NessChannelState,
 }
 
@@ -176,17 +180,16 @@ impl Handler for ServerHandler {
         Ok(Auth::Accept)
     }
 
-    #[instrument(parent = &self.span, skip(self, session))]
+    #[instrument(parent = &self.span, skip(self, _session))]
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        println!("channel open session");
-
         self.channels.insert(
             channel.id(),
             NessChannel {
+                env: HashMap::new(),
                 state: NessChannelState::Plain,
             },
         );
@@ -250,6 +253,7 @@ impl Handler for ServerHandler {
                 let mut child = tokio::process::Command::new("bash")
                     .env_clear()
                     .kill_on_drop(true)
+                    .envs(channel.env.clone())
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -283,6 +287,7 @@ impl Handler for ServerHandler {
                 let child = pty_process::Command::new("bash")
                     .env_clear()
                     .kill_on_drop(true)
+                    .envs(channel.env.clone())
                     .spawn(pts)
                     .context("Failed to spawn a process")?;
 
@@ -334,6 +339,7 @@ impl Handler for ServerHandler {
                 let mut child = tokio::process::Command::new(cmd)
                     .env_clear()
                     .kill_on_drop(true)
+                    .envs(channel.env.clone())
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -367,6 +373,7 @@ impl Handler for ServerHandler {
                 let child = pty_process::Command::new(cmd)
                     .env_clear()
                     .kill_on_drop(true)
+                    .envs(channel.env.clone())
                     .spawn(pts)
                     .context("Failed to spawn a process")?;
 
@@ -396,7 +403,7 @@ impl Handler for ServerHandler {
         Ok(())
     }
 
-    #[instrument(parent = &self.span, skip(self, session))]
+    #[instrument(parent = &self.span, skip(self, _session))]
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
@@ -404,7 +411,7 @@ impl Handler for ServerHandler {
         row_height: u32,
         pix_width: u32,
         pix_height: u32,
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let mut channel = self
             .channels
@@ -483,6 +490,30 @@ impl Handler for ServerHandler {
         drop(self.channels.remove(&channel));
         Ok(())
     }
+
+    #[tracing::instrument(parent = &self.span, skip(self, _session))]
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let mut channel = self
+            .channels
+            .get_mut(&channel)
+            .context("No channel found")?;
+
+        channel
+            .env
+            .insert(variable_name.to_owned(), variable_value.to_owned());
+
+        Ok(())
+    }
+
+    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+        Ok(Some("Authenticating...\r\n".into()))
+    }
 }
 
 async fn pipe_to_channel<R>(
@@ -531,12 +562,14 @@ async fn close_channel(
         .exit_status_request(channel_id, our_exit_status)
         .await
     {
-        // todo: track error
+        tracing::error!(?error, "sending exit status failed");
     }
+
     if let Err(error) = handle.eof(channel_id).await {
-        // todo: track error
+        tracing::error!(?error, "sending eof failed");
     }
+
     if let Err(error) = handle.close(channel_id).await {
-        // todo: track error
+        tracing::error!(?error, "sending close failed");
     }
 }
