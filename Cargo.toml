@@ -1,0 +1,15 @@
+[package]
+name = "ness-sshd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.32", features = ["derive"] }
+dashmap = "6.1.0"
+pty-process = { version = "0.5.1", features = ["async"] }
+russh = "0.51.1"
+tokio = { version = "1.44.1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+uuid = { version = "1.16.0", features = ["v7"] }
