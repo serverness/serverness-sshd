@@ -1,6 +1,7 @@
 use anyhow::{Context, bail};
 use clap::Parser;
 use dashmap::DashMap;
+use nix::unistd::{self, Gid, Uid};
 use pty_process::{OwnedWritePty, Pts};
 use russh::{
     Channel,
@@ -16,8 +17,8 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
 };
-use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use tracing::{error, info, instrument, trace};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -31,6 +32,20 @@ struct Cli {
 
     #[arg(long)]
     listen: SocketAddr,
+
+    #[arg(long)]
+    gid: Option<u32>,
+
+    #[arg(long)]
+    uid: Option<u32>,
+
+    #[arg(long)]
+    executor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerContext {
+    executor: String,
 }
 
 #[tokio::main]
@@ -46,6 +61,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Cli::parse();
+
+    let executor = if let Some(executor) = args.executor {
+        executor
+    } else {
+        "/opt/podman/bin/podman".to_string()
+    };
 
     let keys: Vec<PrivateKey> = args
         .hostkey
@@ -65,18 +86,32 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let mut sshd = SshServer {};
+    let context = ServerContext { executor };
 
-    let address = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 2222);
+    let mut sshd = SshServer { context };
 
-    sshd.run_on_address(Arc::new(config), address)
+    let listener = TcpListener::bind(args.listen)
+        .await
+        .context("Failed to bind to address")?;
+
+    if let Some(gid) = args.gid {
+        unistd::setgid(Gid::from_raw(gid)).context("Failed to drop privileges using setgid")?;
+    }
+
+    if let Some(uid) = args.uid {
+        unistd::setuid(Uid::from_raw(uid)).context("Failed to drop privileges using setuid")?;
+    }
+
+    sshd.run_on_socket(Arc::new(config), &listener)
         .await
         .context("Failed to start the ssh server")?;
 
     Ok(())
 }
 
-struct SshServer {}
+struct SshServer {
+    context: ServerContext,
+}
 
 impl SshServer {}
 
@@ -106,6 +141,7 @@ struct NessChannel {
 struct User {}
 
 struct ServerHandler {
+    context: ServerContext,
     span: tracing::Span,
 
     client_id: Uuid,
@@ -130,6 +166,7 @@ impl Server for SshServer {
             client_address,
             channels,
             user: None,
+            context: self.context.clone(),
         }
     }
 
@@ -254,8 +291,6 @@ impl Handler for ServerHandler {
             .remove(&channel_id)
             .context("No channel found")?;
 
-        let executor = "/opt/podman/bin/podman";
-
         let next_state = match channel.state {
             NessChannelState::Interactive {
                 col_width,
@@ -266,15 +301,16 @@ impl Handler for ServerHandler {
                 let executor_args = &[
                     "run",
                     "--rm",
+                    "--network=host",
                     "-it",
                     "serverness-shell",
                     "--address",
-                    "127.0.0.1:8000",
+                    "http://127.0.0.1:8000",
                     "--secret",
                     "foo",
                 ];
 
-                let child = pty_process::Command::new(executor)
+                let child = pty_process::Command::new(self.context.executor.clone())
                     .args(executor_args)
                     .env_clear()
                     .kill_on_drop(true)
@@ -316,8 +352,6 @@ impl Handler for ServerHandler {
     ) -> Result<(), Self::Error> {
         let cmd = String::from_utf8(data.to_vec())?;
 
-        let executor = "/opt/podman/bin/podman";
-
         info!(?cmd);
 
         let handle = session.handle();
@@ -331,17 +365,18 @@ impl Handler for ServerHandler {
             NessChannelState::Plain => {
                 let executor_args = &[
                     "run",
+                    "--network=host",
                     "--rm",
                     "serverness-shell",
                     "--address",
-                    "127.0.0.1:8000",
+                    "http://127.0.0.1:8000",
                     "--secret",
                     "foo",
                     "--command",
                     &cmd,
                 ];
 
-                let mut child = tokio::process::Command::new(executor)
+                let mut child = tokio::process::Command::new(self.context.executor.clone())
                     .args(executor_args)
                     .env_clear()
                     .kill_on_drop(true)
@@ -378,16 +413,17 @@ impl Handler for ServerHandler {
                 let executor_args = &[
                     "run",
                     "--rm",
+                    "--network=host",
                     "-it",
                     "serverness-shell",
                     "--address",
-                    "127.0.0.1:8000",
+                    "http://127.0.0.1:8000",
                     "--secret",
                     "foo",
                     "--command",
                     &cmd,
                 ];
-                let child = pty_process::Command::new(executor)
+                let child = pty_process::Command::new(self.context.executor.clone())
                     .args(executor_args)
                     .env_clear()
                     .kill_on_drop(true)

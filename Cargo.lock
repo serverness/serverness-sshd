@@ -994,6 +994,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dashmap",
+ "nix",
  "pty-process",
  "russh",
  "shell-words",
