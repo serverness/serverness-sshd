@@ -103,6 +103,8 @@ struct NessChannel {
     state: NessChannelState,
 }
 
+struct User {}
+
 struct ServerHandler {
     span: tracing::Span,
 
@@ -110,6 +112,8 @@ struct ServerHandler {
     client_address: Option<SocketAddr>,
 
     channels: Arc<DashMap<ChannelId, NessChannel>>,
+
+    user: Option<User>,
 }
 
 impl Server for SshServer {
@@ -125,6 +129,7 @@ impl Server for SshServer {
             client_id,
             client_address,
             channels,
+            user: None,
         }
     }
 
@@ -177,6 +182,7 @@ impl Handler for ServerHandler {
         user: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
+        self.user = Some(User {});
         Ok(Auth::Accept)
     }
 
@@ -248,98 +254,25 @@ impl Handler for ServerHandler {
             .remove(&channel_id)
             .context("No channel found")?;
 
-        let next_state = match channel.state {
-            NessChannelState::Plain => {
-                let mut child = tokio::process::Command::new("bash")
-                    .env_clear()
-                    .kill_on_drop(true)
-                    .envs(channel.env.clone())
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .context("Failed to spawn a process")?;
-
-                info!(pid = child.id(), "process spawned");
-
-                let stdout = child.stdout.take().context("Failed to take the stdout")?;
-                pipe_to_channel(channel_id, handle.clone(), stdout).await;
-
-                let stderr = child.stderr.take().context("Failed to take the stderr")?;
-                pipe_to_channel(channel_id, handle.clone(), stderr).await;
-
-                let writer = child.stdin.take().context("Failed to take the stdin")?;
-
-                let abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
-
-                Some(NessChannelState::Exec {
-                    abort_handle,
-                    writer,
-                })
-            }
-
-            NessChannelState::Interactive {
-                col_width,
-                row_height,
-                pts,
-                writer,
-            } => {
-                let child = pty_process::Command::new("bash")
-                    .env_clear()
-                    .kill_on_drop(true)
-                    .envs(channel.env.clone())
-                    .spawn(pts)
-                    .context("Failed to spawn a process")?;
-
-                info!(pid = child.id(), "process spawned");
-
-                let abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
-
-                writer
-                    .resize(pty_process::Size::new(row_height as u16, col_width as u16))
-                    .context("Failed to resize the PTY")?;
-
-                Some(NessChannelState::PtyExec {
-                    abort_handle,
-                    writer,
-                })
-            }
-
-            _ => bail!("Expected Plain or Interactive sessions"),
-        };
-
-        if let Some(state) = next_state {
-            channel.state = state;
-
-            self.channels.insert(channel_id, channel);
-        }
-
-        Ok(())
-    }
-
-    #[instrument(parent = &self.span, skip(self, session))]
-    async fn exec_request(
-        &mut self,
-        channel_id: ChannelId,
-        data: &[u8],
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        let cmd = String::from_utf8(data.to_vec())?;
-        info!(?cmd);
-
-        let handle = session.handle();
-
-        let (_, mut channel) = self
-            .channels
-            .remove(&channel_id)
-            .context("No channel found")?;
+        let executor = "/opt/podman/bin/podman";
 
         let next_state = match channel.state {
             NessChannelState::Plain => {
-                let mut child = tokio::process::Command::new(cmd)
+                let executor_args = &[
+                    "run",
+                    "--rm",
+                    "serverness-shell",
+                    "--address",
+                    "127.0.0.1:8000",
+                    "--secret",
+                    "foo",
+                    "--stdin",
+                ];
+
+                let mut child = tokio::process::Command::new(executor)
+                    .args(executor_args)
                     .env_clear()
                     .kill_on_drop(true)
-                    .envs(channel.env.clone())
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped())
@@ -370,10 +303,134 @@ impl Handler for ServerHandler {
                 pts,
                 writer,
             } => {
-                let child = pty_process::Command::new(cmd)
+                let executor_args = &[
+                    "run",
+                    "--rm",
+                    "-it",
+                    "serverness-shell",
+                    "--address",
+                    "127.0.0.1:8000",
+                    "--secret",
+                    "foo",
+                ];
+
+                let child = pty_process::Command::new(executor)
+                    .args(executor_args)
                     .env_clear()
                     .kill_on_drop(true)
-                    .envs(channel.env.clone())
+                    .spawn(pts)
+                    .context("Failed to spawn a process")?;
+
+                info!(pid = child.id(), "process spawned");
+
+                let abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
+                writer
+                    .resize(pty_process::Size::new(row_height as u16, col_width as u16))
+                    .context("Failed to resize the PTY")?;
+
+                Some(NessChannelState::PtyExec {
+                    abort_handle,
+                    writer,
+                })
+            }
+
+            _ => bail!("Expected an interactive sessions"),
+        };
+
+        if let Some(state) = next_state {
+            channel.state = state;
+
+            self.channels.insert(channel_id, channel);
+        }
+
+        Ok(())
+    }
+
+    #[instrument(parent = &self.span, skip(self, session))]
+    async fn exec_request(
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8(data.to_vec())?;
+
+        let executor = "/opt/podman/bin/podman";
+
+        info!(?cmd);
+
+        let handle = session.handle();
+
+        let (_, mut channel) = self
+            .channels
+            .remove(&channel_id)
+            .context("No channel found")?;
+
+        let next_state = match channel.state {
+            NessChannelState::Plain => {
+                let executor_args = &[
+                    "run",
+                    "--rm",
+                    "serverness-shell",
+                    "--address",
+                    "127.0.0.1:8000",
+                    "--secret",
+                    "foo",
+                    "--command",
+                    &cmd,
+                ];
+
+                let mut child = tokio::process::Command::new(executor)
+                    .args(executor_args)
+                    .env_clear()
+                    .kill_on_drop(true)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .context("Failed to spawn a command")?;
+
+                info!(pid = child.id(), "process spawned");
+
+                let stdout = child.stdout.take().context("Failed to take the stdout")?;
+                pipe_to_channel(channel_id, handle.clone(), stdout).await;
+
+                let stderr = child.stderr.take().context("Failed to take the stderr")?;
+                pipe_to_channel(channel_id, handle.clone(), stderr).await;
+
+                let writer = child.stdin.take().context("Failed to take the stdin")?;
+
+                let abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
+
+                Some(NessChannelState::Exec {
+                    abort_handle,
+                    writer,
+                })
+            }
+
+            NessChannelState::Interactive {
+                col_width,
+                row_height,
+                pts,
+                writer,
+            } => {
+                let executor_args = &[
+                    "run",
+                    "--rm",
+                    "-it",
+                    "serverness-shell",
+                    "--address",
+                    "127.0.0.1:8000",
+                    "--secret",
+                    "foo",
+                    "--command",
+                    &cmd,
+                ];
+                let child = pty_process::Command::new(executor)
+                    .args(executor_args)
+                    .env_clear()
+                    .kill_on_drop(true)
                     .spawn(pts)
                     .context("Failed to spawn a process")?;
 
@@ -511,9 +568,9 @@ impl Handler for ServerHandler {
         Ok(())
     }
 
-    async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
+    /* async fn authentication_banner(&mut self) -> Result<Option<String>, Self::Error> {
         Ok(Some("Authenticating...\r\n".into()))
-    }
+    } */
 }
 
 async fn pipe_to_channel<R>(
