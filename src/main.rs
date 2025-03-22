@@ -257,46 +257,6 @@ impl Handler for ServerHandler {
         let executor = "/opt/podman/bin/podman";
 
         let next_state = match channel.state {
-            NessChannelState::Plain => {
-                let executor_args = &[
-                    "run",
-                    "--rm",
-                    "serverness-shell",
-                    "--address",
-                    "127.0.0.1:8000",
-                    "--secret",
-                    "foo",
-                    "--stdin",
-                ];
-
-                let mut child = tokio::process::Command::new(executor)
-                    .args(executor_args)
-                    .env_clear()
-                    .kill_on_drop(true)
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .context("Failed to spawn a command")?;
-
-                info!(pid = child.id(), "process spawned");
-
-                let stdout = child.stdout.take().context("Failed to take the stdout")?;
-                pipe_to_channel(channel_id, handle.clone(), stdout).await;
-
-                let stderr = child.stderr.take().context("Failed to take the stderr")?;
-                pipe_to_channel(channel_id, handle.clone(), stderr).await;
-
-                let writer = child.stdin.take().context("Failed to take the stdin")?;
-
-                let abort_handle = self.wait_and_close_channel(channel_id, handle, child).await;
-
-                Some(NessChannelState::Exec {
-                    abort_handle,
-                    writer,
-                })
-            }
-
             NessChannelState::Interactive {
                 col_width,
                 row_height,
