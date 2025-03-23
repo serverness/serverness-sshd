@@ -17,8 +17,11 @@ use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
 };
-use tokio::process::ChildStdin;
-use tokio::{io::AsyncWriteExt, net::TcpListener};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
+use tokio::{process::ChildStdin, sync::oneshot};
 use tracing::{error, info, instrument, trace};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -41,11 +44,15 @@ struct Cli {
 
     #[arg(long)]
     executor: Option<String>,
+
+    #[arg(long)]
+    registrator: String,
 }
 
 #[derive(Debug, Clone)]
 struct ServerContext {
     executor: String,
+    registrator: String,
 }
 
 #[tokio::main]
@@ -86,7 +93,10 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let context = ServerContext { executor };
+    let context = ServerContext {
+        executor,
+        registrator: args.registrator,
+    };
 
     let mut sshd = SshServer { context };
 
@@ -219,15 +229,15 @@ impl Handler for ServerHandler {
         user: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        self.user = Some(User {});
+        // self.user = Some(User {});
         Ok(Auth::Accept)
     }
 
-    #[instrument(parent = &self.span, skip(self, _session))]
+    #[instrument(parent = &self.span, skip(self, session))]
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
         self.channels.insert(
             channel.id(),
@@ -275,6 +285,8 @@ impl Handler for ServerHandler {
             _ => {}
         }
 
+        session.channel_success(channel_id)?;
+
         Ok(())
     }
 
@@ -298,24 +310,34 @@ impl Handler for ServerHandler {
                 pts,
                 writer,
             } => {
-                let executor_args = &[
-                    "run",
-                    "--rm",
-                    "--network=host",
-                    "-it",
-                    "serverness-shell",
-                    "--address",
-                    "http://127.0.0.1:8000",
-                    "--secret",
-                    "foo",
-                ];
+                let child = match self.user {
+                    Some(_) => {
+                        let executor_args = &[
+                            "run",
+                            "--rm",
+                            "--network=host",
+                            "-it",
+                            "serverness-shell",
+                            "--address",
+                            "http://127.0.0.1:8000",
+                            "--secret",
+                            "foo",
+                        ];
 
-                let child = pty_process::Command::new(self.context.executor.clone())
-                    .args(executor_args)
-                    .env_clear()
-                    .kill_on_drop(true)
-                    .spawn(pts)
-                    .context("Failed to spawn a process")?;
+                        pty_process::Command::new(self.context.executor.clone())
+                            .args(executor_args)
+                            .env_clear()
+                            .kill_on_drop(true)
+                            .spawn(pts)
+                            .context("Failed to spawn a shell process")?
+                    }
+
+                    None => pty_process::Command::new(self.context.registrator.clone())
+                        .env_clear()
+                        .kill_on_drop(true)
+                        .spawn(pts)
+                        .context("Failed to spawn a registrator process")?,
+                };
 
                 info!(pid = child.id(), "process spawned");
 
@@ -340,6 +362,8 @@ impl Handler for ServerHandler {
             self.channels.insert(channel_id, channel);
         }
 
+        session.channel_success(channel_id)?;
+
         Ok(())
     }
 
@@ -350,6 +374,12 @@ impl Handler for ServerHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let None = self.user {
+            let _ = session.handle().close(channel_id).await;
+
+            return Ok(());
+        }
+
         let cmd = String::from_utf8(data.to_vec())?;
 
         info!(?cmd);
