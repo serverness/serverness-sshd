@@ -5,10 +5,11 @@ use nix::unistd::{self, Gid, Uid};
 use pty_process::{OwnedWritePty, Pts};
 use russh::{
     Channel,
-    keys::PrivateKey,
+    keys::{PrivateKey, PublicKey},
     server::{Handler, Msg, Server, Session},
 };
 use russh::{ChannelId, CryptoVec, server::*};
+use serverness_accounts;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,12 +48,17 @@ struct Cli {
 
     #[arg(long)]
     registrator: String,
+
+    #[arg(long)]
+    accounts_address: String,
 }
 
 #[derive(Debug, Clone)]
 struct ServerContext {
     executor: String,
     registrator: String,
+    accounts: serverness_accounts::Client,
+    accounts_address: String,
 }
 
 #[tokio::main]
@@ -75,6 +81,13 @@ async fn main() -> anyhow::Result<()> {
         "/opt/podman/bin/podman".to_string()
     };
 
+    let accounts = serverness_accounts::Client::new_authenticated_config(
+        &serverness_accounts::ClientConfig::default()
+            .with_auth(args.accounts_address.clone(), "")
+            .with_insecure(true),
+    )
+    .expect("Failed to build the client");
+
     let keys: Vec<PrivateKey> = args
         .hostkey
         .iter()
@@ -96,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
     let context = ServerContext {
         executor,
         registrator: args.registrator,
+        accounts,
+        accounts_address: args.accounts_address.clone(),
     };
 
     let mut sshd = SshServer { context };
@@ -148,7 +163,18 @@ struct NessChannel {
     state: NessChannelState,
 }
 
-struct User {}
+#[derive(Clone)]
+enum User {
+    Existing {
+        secret: String,
+    },
+
+    NonExisting {
+        user: String,
+        public_key: String,
+        fingerprint: String,
+    },
+}
 
 struct ServerHandler {
     context: ServerContext,
@@ -229,7 +255,28 @@ impl Handler for ServerHandler {
         user: &str,
         public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        // self.user = Some(User {});
+        let request = self.context.accounts.session_create().body(
+            serverness_accounts::types::Credentials::SshPublicKey(public_key.to_openssh()?),
+        );
+
+        match request.send().await {
+            Ok(r) => {
+                self.user = Some(User::Existing {
+                    secret: r.secret.clone(),
+                })
+            }
+
+            Err(e) => {
+                self.user = Some(User::NonExisting {
+                    user: user.into(),
+                    public_key: public_key.to_openssh()?,
+                    fingerprint: public_key
+                        .fingerprint(russh::keys::HashAlg::Sha512)
+                        .to_string(),
+                })
+            }
+        }
+
         Ok(Auth::Accept)
     }
 
@@ -297,6 +344,7 @@ impl Handler for ServerHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let handle = session.handle();
+        let user = self.user.clone();
 
         let (_, mut channel) = self
             .channels
@@ -310,8 +358,10 @@ impl Handler for ServerHandler {
                 pts,
                 writer,
             } => {
-                let child = match self.user {
-                    Some(_) => {
+                let child = match user {
+                    Some(User::Existing { secret }) => {
+                        let secret = secret.clone();
+
                         let executor_args = &[
                             "run",
                             "--rm",
@@ -321,7 +371,7 @@ impl Handler for ServerHandler {
                             "--address",
                             "http://127.0.0.1:8000",
                             "--secret",
-                            "foo",
+                            &secret,
                         ];
 
                         pty_process::Command::new(self.context.executor.clone())
@@ -332,11 +382,25 @@ impl Handler for ServerHandler {
                             .context("Failed to spawn a shell process")?
                     }
 
-                    None => pty_process::Command::new(self.context.registrator.clone())
+                    Some(User::NonExisting {
+                        user,
+                        public_key,
+                        fingerprint,
+                    }) => pty_process::Command::new(self.context.registrator.clone())
+                        .arg("--accounts-address")
+                        .arg(self.context.accounts_address.clone())
+                        .arg("--fingerprint")
+                        .arg(fingerprint)
+                        .arg("--public-key")
+                        .arg(public_key)
                         .env_clear()
                         .kill_on_drop(true)
                         .spawn(pts)
                         .context("Failed to spawn a registrator process")?,
+
+                    None => {
+                        bail!("Expected a user")
+                    }
                 };
 
                 info!(pid = child.id(), "process spawned");
